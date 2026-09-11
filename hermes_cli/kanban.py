@@ -373,6 +373,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            dispatch_hold=bool(getattr(args, "dispatch_hold", False)),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -380,10 +381,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        held = (f"  (held — out of auto-dispatch until "
+                f"`hermes kanban unblock {task_id}`)" if task.dispatch_hold else "")
+        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'}){held}")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
-        if task.status == "ready" and task.assignee:
+        # A held card is parked on purpose, so the missing-gateway warning is noise.
+        if task.status == "ready" and task.assignee and not task.dispatch_hold:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
@@ -949,7 +953,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled/held?)")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
