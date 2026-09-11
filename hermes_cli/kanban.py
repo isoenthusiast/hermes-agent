@@ -378,11 +378,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        # Auto-hold explains itself: name the run that was already in that
+        # workspace, so a held card never reads as "why is this parked?".
+        conflict = kb.dispatch_hold_conflict(conn, task_id) if task.dispatch_hold else None
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
-        held = (f"  (held — out of auto-dispatch until "
-                f"`hermes kanban unblock {task_id}`)" if task.dispatch_hold else "")
+        held = ""
+        if task.dispatch_hold:
+            why = (f" — {conflict} is already working in {task.workspace_path}"
+                   if conflict else " — filed for work already in flight")
+            held = f"  (held{why}; release with `hermes kanban unblock {task_id}`)"
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'}){held}")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
