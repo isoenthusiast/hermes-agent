@@ -1400,9 +1400,16 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+    """Any *dispatchable* row in ``status`` that maps to a real profile.
+
+    Held rows are excluded for the same reason the lanes exclude them: they are
+    not work waiting for a worker, so counting them would make telemetry report
+    a stuck dispatcher and the gateway tick on every interval for nothing.
+    """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL "
+        "AND dispatch_hold = 0",
         (status,),
     ).fetchall()
     if not rows:
@@ -1893,10 +1900,19 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed, unheld rows of one lane in dispatch order.
+
+    ``dispatch_hold = 0`` is part of the queue predicate, not a status change: a
+    card filed for work that is already in flight (an agent doing it inline)
+    stays ``ready``/``review`` on the board with its assignee — readable in
+    ``list``/``show`` and visible to humans — but no tick claims it until
+    ``hermes kanban unblock <id>`` releases the hold. Status-based routing
+    (parents, triage, review) is untouched.
+    """
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
+        "AND dispatch_hold = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
 

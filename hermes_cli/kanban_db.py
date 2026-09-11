@@ -714,6 +714,9 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    # Dispatcher queue hold: True parks the card in its lane (status/assignee
+    # unchanged) until ``unblock_task`` releases it. See SCHEMA_SQL.
+    dispatch_hold: bool = False
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -732,6 +735,9 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            # Pre-migration boards have no ``dispatch_hold`` column; NULL reads
+            # as "not held", which is the behaviour those rows already had.
+            dispatch_hold=bool(g("dispatch_hold")),
         )
 
 
@@ -941,7 +947,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Dispatch hold. 1 parks a card out of the auto-dispatch queue while
+    -- leaving its status (ready/review) and assignee intact, so a card filed
+    -- for work that is already in flight — an agent doing it inline right
+    -- now — cannot be raced by a second worker on the next tick. Cleared by
+    -- ``unblock_task`` (the paired release verb) or by completion; the
+    -- dispatcher's queue predicate (``_lane_rows``) skips held rows.
+    dispatch_hold        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1232,11 +1245,15 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    dispatch_hold: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    ``dispatch_hold``: keep the card in its lane (status + assignee intact) but
+    out of the auto-dispatch queue until ``unblock_task`` releases it — for work
+    that is already in flight, so a tick cannot race a second worker onto it.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1326,8 +1343,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        dispatch_hold
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1337,6 +1355,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if dispatch_hold else 0,
                     ),
                 )
                 for pid in parents:
@@ -1357,6 +1376,7 @@ def create_task(
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "dispatch_hold": bool(dispatch_hold) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
@@ -2651,7 +2671,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       dispatch_hold = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -3348,11 +3369,36 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def _release_dispatch_hold(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Clear ``dispatch_hold`` in place (status and assignee untouched).
+
+    The paired release verb for ``create_task(dispatch_hold=True)``: the card
+    was never out of its lane, only out of the queue, so releasing it is not a
+    status transition. Called under the caller's write txn; True iff a hold was
+    actually cleared.
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET dispatch_hold = 0 WHERE id = ? AND dispatch_hold = 1",
+        (task_id,),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(conn, task_id, "hold_released", None)
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    Also the release path for a held card: a ``ready``/``review``/``todo`` row
+    whose only parking is ``dispatch_hold`` keeps its status and simply becomes
+    dispatchable again (see ``_release_dispatch_hold``).
+    """
     now = int(time.time())
     with write_txn(conn):
+        if _task_status(conn, task_id) not in ("blocked", "scheduled"):
+            return _release_dispatch_hold(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3373,10 +3419,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # is a fresh start for the retry budget. Any ``dispatch_hold`` goes too:
+        # the operator asked for the card to run.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "dispatch_hold = 0 "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:

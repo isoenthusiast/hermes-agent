@@ -813,6 +813,10 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Dispatch hold: 1 parks a ready/review card out of the auto-dispatch queue
+    # without touching its status; 0 (the default) = normal dispatch. See
+    # ``_lane_rows`` in kanban_db_dispatch.
+    ("dispatch_hold", "dispatch_hold INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

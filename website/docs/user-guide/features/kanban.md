@@ -298,6 +298,37 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Hold a card whose work is already in flight (`--hold`)
+
+`ready` + `assigned` is exactly the shape the dispatcher scans for, so a card
+you file for work that is *already happening* — an agent doing the edit inline
+right now, a docs or design pass you are mid-way through — gets claimed on the
+next tick (60s by default) and a second worker starts on the same work.
+
+```bash
+# File the card so the board still shows it, but no tick can claim it
+hermes kanban create "customise the greeting copy" --assignee me --hold
+
+# It reads as held until you release it (the next dispatch tick spawns nothing)
+hermes kanban list
+# ▶ t_abcd  ready     me                   ⏸held  customise the greeting copy
+
+# Release it back into the queue when the inline work is done
+hermes kanban unblock t_abcd
+```
+
+The hold is a **queue filter, not a status**: the card keeps its `ready`
+status, its assignee and its place on the board, and every status-based rule
+(parents, triage, review, recurrence breaker) behaves exactly as before. Only
+dispatcher *selection* skips it — `_lane_rows` adds `dispatch_hold = 0` to the
+queue predicate in both the `ready` and `review` lanes — so a held card is
+never spawned by a tick, never receives `kanban.default_assignee` (that only
+applies to rows the lanes hand out), and is never counted as dispatchable work
+by the probe behind the stuck-dispatcher telemetry and the gateway's tick
+trigger. `unblock` clears the flag in place (no status change), `complete`
+clears it too, and a held `ready` card is excluded from the *stranded in ready*
+diagnostic because it is parked on purpose rather than stuck.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

@@ -200,6 +200,12 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--hold", action="store_true", dest="dispatch_hold",
+             help="Park the card out of the auto-dispatch queue (its status "
+                  "stays ready) until `hermes kanban unblock <id>` releases it. "
+                  "Use when the work is already in flight — an agent is doing it "
+                  "inline right now — so the next tick cannot race a second "
+                  "worker onto it."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -308,7 +314,8 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    ], help="Return blocked/scheduled tasks to ready (todo while parents remain open), "
+            "or release a card created with --hold back into the dispatch queue"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

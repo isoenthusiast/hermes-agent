@@ -630,6 +630,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
+    # A held card is parked on purpose (the work is being done inline) — it is
+    # not stranded, and flagging it would train operators to clear holds.
+    if _task_field(task, "dispatch_hold", 0):
+        return []
     # A live claim means it's being worked on even without progress yet.
     if _task_field(task, "claim_lock"):
         return []
