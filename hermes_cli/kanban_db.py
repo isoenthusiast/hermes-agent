@@ -1254,6 +1254,9 @@ def create_task(
     ``dispatch_hold``: keep the card in its lane (status + assignee intact) but
     out of the auto-dispatch queue until ``unblock_task`` releases it — for work
     that is already in flight, so a tick cannot race a second worker onto it.
+    A card that lands ``ready``+assigned on a workspace a live run already holds
+    is held automatically (see ``active_workspace_run``): the guardrail is the
+    default, not something each filer has to remember.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1334,6 +1337,18 @@ def create_task(
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
 
+                # Auto-hold (t_7a11faa8): a card that lands ready+assigned on a
+                # workspace a live run already holds is exactly the shape the
+                # next tick claims — the duplicate-worker incident this column
+                # exists for. Decided here, not at the call site, so the
+                # guardrail is the default for every filer (CLI, tool,
+                # dashboard, cron) instead of something each one must remember.
+                hold_conflict = None
+                if not dispatch_hold and task_status == "ready" and assignee and workspace_path:
+                    hold_conflict = active_workspace_run(conn, workspace_path)
+                    if hold_conflict:
+                        dispatch_hold = True
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1377,6 +1392,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "dispatch_hold": bool(dispatch_hold) or None,
+                        "dispatch_hold_conflict": hold_conflict,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
@@ -3367,6 +3383,68 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
     unblock/reopen so neither can spawn a child whose upstream is unfinished."""
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
+
+
+def _normalize_workspace_path(path: Optional[str]) -> Optional[str]:
+    """Comparable form of a workspace path (empty -> ``None``).
+
+    Two cards share a workspace when their *normalized* paths match: the
+    dispatcher resolves both through ``resolve_workspace``, so lexical spelling
+    differences (symlink, ``..``, trailing slash, Windows case) must not hide a
+    collision.
+    """
+    if not path:
+        return None
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def active_workspace_run(
+    conn: sqlite3.Connection, workspace_path: Optional[str],
+) -> Optional[str]:
+    """Id of a task with a live claim in ``workspace_path``, else ``None``.
+
+    The "is this workspace busy" probe behind the create-time hold. Reuses the
+    dispatcher's own bookkeeping — ``claim_lock`` + an unexpired
+    ``claim_expires`` is exactly what ``release_stale_claims`` reclaims and
+    ``reconcile_orphaned_running`` treats as broken — instead of inventing a
+    second source of truth, so a crashed worker stops counting as busy as soon
+    as the reclaim sweep runs.
+
+    Status is deliberately not filtered: a claim in either lane (``running`` or
+    a claimed ``review``) is a worker inside that path right now. The query only
+    looks at rows holding a live claim (normally a handful), so it stays off the
+    create path's critical cost.
+    """
+    target = _normalize_workspace_path(workspace_path)
+    if target is None:
+        return None
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE claim_lock IS NOT NULL AND claim_expires IS NOT NULL "
+        "  AND claim_expires >= ?",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        if _normalize_workspace_path(row["workspace_path"]) == target:
+            return row["id"]
+    return None
+
+
+def dispatch_hold_conflict(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Task id the create-time hold was taken against, or ``None``.
+
+    Read back from the ``created`` event so a surface can explain *why* a card
+    it just filed is parked without re-running the probe (the busy run may have
+    finished by then). ``None`` means the hold was requested explicitly, or the
+    card is not held.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY id ASC LIMIT 1", (task_id,),
+    ).fetchone()
+    conflict = _json_dict(_row_get(row, "payload")).get("dispatch_hold_conflict")
+    return str(conflict) if conflict else None
 
 
 def _release_dispatch_hold(conn: sqlite3.Connection, task_id: str) -> bool:

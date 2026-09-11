@@ -502,7 +502,7 @@ _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "dispatch_hold")
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -1026,6 +1026,7 @@ def _handle_create(args: dict, **kw) -> str:
         _parse_bool_arg(args, "goal_mode"))
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+    hold = _parse_bool_arg(args, "hold")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
@@ -1052,8 +1053,18 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
+            dispatch_hold=hold,
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+        # A held card is parked, not queued: say so in the payload the caller
+        # reads, and name the in-flight run that triggered an automatic hold so
+        # nobody has to guess who is still working in that workspace.
+        if landed.get("dispatch_hold"):
+            conflict = kb.dispatch_hold_conflict(conn, new_tid)
+            landed["hold_reason"] = (
+                f"workspace {landed.get('workspace_path')} already has an active run ({conflict})"
+                if conflict else
+                "requested — release with kanban_unblock when the in-flight work is done")
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 

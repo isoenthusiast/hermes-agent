@@ -356,7 +356,11 @@ KANBAN_CREATE_SCHEMA = _schema(
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. "
+        "Pass ``hold`` when the work is already in flight (you are doing "
+        "it inline) — and a card filed into a workspace an active run "
+        "already holds is held for you, so nothing spawns a second worker "
+        "onto it. Release either with ``kanban_unblock``."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
@@ -413,6 +417,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "If true, task lands in 'triage' instead of 'todo' "
                 "— a specifier profile is expected to flesh out "
                 "the body before work starts."
+        )),
+        "hold": _prop("boolean", (
+                "Create the card held: it keeps its status, "
+                "assignee and place on the board, but no dispatch "
+                "tick may claim it until kanban_unblock releases "
+                "it. Pass true when the work is already in flight "
+                "(you are doing it inline right now) so the "
+                "dispatcher cannot spawn a second worker onto it. "
+                "A card that lands 'ready' in a workspace an "
+                "active run already holds is held automatically "
+                "and the response says why."
         )),
         "idempotency_key": _prop("string", (
                 "If a non-archived task with this key already "

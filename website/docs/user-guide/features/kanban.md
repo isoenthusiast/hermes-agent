@@ -329,6 +329,40 @@ trigger. `unblock` clears the flag in place (no status change), `complete`
 clears it too, and a held `ready` card is excluded from the *stranded in ready*
 diagnostic because it is parked on purpose rather than stuck.
 
+#### Held for you when the workspace is already busy
+
+`--hold` only helps a filer who remembers it, so the dispatcher holds one class
+of card on its own: a card that lands `ready`, assigned, with an **explicit
+workspace path** (`--workspace dir:/path`, `--workspace worktree:/path`, or the
+board's `default_workdir`) that a live run already holds. The create output
+names the run it was held against:
+
+```bash
+$ hermes kanban create "next pass over the design doc" --assignee me \
+      --workspace dir:~/work/design
+Created t_7ef  (ready, assignee=me)  (held — t_6ac is already working in ~/work/design; release with `hermes kanban unblock t_7ef`)
+```
+
+"Already busy" means another task has a **live claim** on that path — a
+`claim_lock` plus an unexpired `claim_expires`, the same bookkeeping
+`release_stale_claims` reclaims — in either dispatch lane. A crashed worker's
+claim is *not* live: once it has expired nothing is held, so a dead run can
+never park every card filed after it. The check reads the resolved path at
+create time, so plain `scratch` cards and per-task project worktrees (fresh
+directory each) are never held, and two cards for the same shared path created
+while it is idle both queue as usual. It is a create-time check: a workspace
+that becomes busy *after* the card was created is not re-checked, and a parked
+card is not flagged by the *stranded in ready* diagnostic.
+
+Release is the same verb for both: `--hold` and an automatic hold set the same
+`dispatch_hold` flag, and `unblock` clears it. There is deliberately no
+auto-release — the filer is the one who knows whether the inline work *replaced*
+the card (complete/archive it) or merely *deferred* it (unblock it).
+
+The tool surface runs the same probe: `kanban_create(..., hold=True)` parks a
+card on request, and an automatic hold comes back as `dispatch_hold: true` plus
+a `hold_reason` naming the busy run, so a held child card is never a mystery.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -389,7 +423,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, `hold` (park it — also set automatically for a workspace with an active run), etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
 
