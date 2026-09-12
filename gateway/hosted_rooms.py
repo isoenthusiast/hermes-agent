@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from contextlib import closing
 from functools import partial
 from pathlib import Path
@@ -415,17 +416,42 @@ _connect = partial(
     connect, db_label="state.db (hosted_rooms)", ready=_schema_is_current,
     initialize=lambda conn: _initialize_schema(conn), lock_retries=_JOURNAL_MODE_LOCK_RETRIES)
 
+# A ``mode=ro`` reader of a WAL store cannot perform the -shm recovery an in-flight writer
+# checkpoint/reset needs, so a transient SQLITE_IOERR surfaces as "disk I/O error" for a
+# millisecond-wide window. Retry a bounded number of times (mirrors
+# ``hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS``; #100436) before classifying the store broken.
+_READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
+
+
+def _open_room_store_read_only(path: Path) -> sqlite3.Connection:
+    """``mode=ro`` room-store open with the bounded transient-IOERR retry a WAL reader needs."""
+    for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS):
+        try:
+            return open_sqlite(path, read_only=True)
+        except sqlite3.OperationalError as exc:
+            if attempt + 1 >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or "disk i/o error" not in str(exc).lower():
+                raise
+            time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+    raise AssertionError("unreachable: retry loop returns or raises")
+
 
 def _read_connection(db_path: DbPath) -> sqlite3.Connection:
-    """Open the room store without steady-state journal or migration writes."""
+    """Open the room store READ-ONLY: the read path writes nothing, so it must not hold a
+    write handle on a store another process owns (a read-only UI/worker holding O_RDWR on the
+    shared ``state.db`` is what forces the weaker "writers = supervised services" invariant).
+
+    Two cases still need the writable bootstrap (WAL + migration), which is what this did
+    unconditionally before: a store that does not exist yet, and a schema that is not current.
+    Both route through ``_connect`` and then re-open read-only.
+    """
     path = Path(db_path)
     if not path.is_file():
         _connect(path).close()
-    conn = open_sqlite(path)
+    conn = _open_room_store_read_only(path)
     if not _schema_is_current(conn):
         conn.close()
         _connect(path).close()
-        conn = open_sqlite(path)
+        conn = _open_room_store_read_only(path)
     return conn
 
 
@@ -571,7 +597,16 @@ def _prune_disbanded_rooms_locked(
 
 
 def prune_disbanded_rooms(db_path: DbPath, *, now: float | None = None) -> int:
-    """Purge deleted Group Chat payloads while reserving their identities."""
+    """Purge deleted Group Chat payloads while reserving their identities.
+
+    Every retention candidate requires ``disbanded_at IS NOT NULL``, so a store with no
+    disbanded rooms returns 0 without a write transaction: a backend that runs this at
+    boot must not take ``BEGIN IMMEDIATE`` on the shared store to learn there is nothing
+    to do (the writable prune still runs, unchanged, whenever a tombstone exists).
+    """
+    with closing(_read_connection(db_path)) as conn:
+        if conn.execute("SELECT 1 FROM hosted_rooms WHERE disbanded_at IS NOT NULL LIMIT 1").fetchone() is None:
+            return 0
     with _transaction(db_path, immediate=True) as conn:
         return _prune_disbanded_rooms_locked(conn, now=_now(now))
 
@@ -579,7 +614,7 @@ def prune_disbanded_rooms(db_path: DbPath, *, now: float | None = None) -> int:
 # --- room links / grants / reservations / remote runs ---------------------------------
 def list_room_link_records(db_path: DbPath) -> list[dict[str, Any]]:
     """Return private RoomLink records without logging or formatting grants."""
-    with _transaction(db_path) as conn:
+    with closing(_read_connection(db_path)) as conn:
         rows = conn.execute("""SELECT room_id, member_id, target_url, target_profile, grant,
                       catalog_json, cancellation_scope_id, trace_id,
                       transport_security, status, updated_at

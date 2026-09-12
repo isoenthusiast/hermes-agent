@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from gateway import hosted_rooms
 from gateway.hosted_rooms_common import DbPath, compact_json, fenced_update
@@ -105,9 +106,26 @@ class HostedRoomPolicyCheckpoint:
     """Incrementally index room policy without compacting visible history."""
     def __init__(self, db_path: DbPath) -> None:
         self.db_path = Path(db_path)
-        with self._connect() as conn:
+        with self._connection() as conn:
             for ddl in _SCHEMA_DDL:
                 conn.execute(ddl)
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Checkpoint connection, CLOSED when the operation ends.
+
+        ``with conn:`` manages only the transaction — it never closes the handle, so the
+        connection (plus its ``-wal``/``-shm``) stayed open ``O_RDWR`` on the shared
+        ``state.db`` until the cycle collector happened to run: a write handle held by a
+        read-mostly surface, and one more per checkpoint operation. Commit on success is
+        kept; closing rolls back an unfinished transaction.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         from hermes_state_wal import apply_wal_with_fallback
@@ -278,7 +296,7 @@ class HostedRoomPolicyCheckpoint:
 
     def sync(self, *, room_id: str, latest_seq: int) -> int:
         """Materialize each unseen event exactly once by durable cursor."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = self._ensure_cursor_and_transcript(conn, room_id)
         if cursor > latest_seq:
@@ -290,7 +308,7 @@ class HostedRoomPolicyCheckpoint:
             next_cursor = int(page.get("cursor") or cursor)
             if not rows or next_cursor <= cursor:
                 raise RuntimeError("hosted room policy cursor did not advance")
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 _require_room(conn, room_id)
                 for event in rows:
@@ -305,7 +323,7 @@ class HostedRoomPolicyCheckpoint:
     def snapshot(self, *, room_id: str, latest_seq: int) -> PolicySnapshot:
         """Return only the oldest active discussion and its watermark set."""
         through_seq = self.sync(room_id=room_id, latest_seq=latest_seq)
-        with self._connect() as conn:
+        with self._connection() as conn:
             cursor = conn.execute(
                 "SELECT stopped_through_seq FROM hosted_room_policy_cursors WHERE room_id=?", (room_id,)).fetchone()
             stopped_through_seq = int(cursor["stopped_through_seq"])
@@ -335,12 +353,12 @@ class HostedRoomPolicyCheckpoint:
             ("""SELECT 1 FROM hosted_room_policy_publications
                      WHERE room_id=? AND task_id=? AND kind IN ('turn.settled', 'turn.failed', 'turn.cancelled')""",
              (room_id, task_id)))
-        with self._connect() as conn:
+        with self._connection() as conn:
             return conn.execute(sql, params).fetchone() is not None
 
     def events_for_task(self, *, room_id: str, source_event_seq: int) -> list[dict[str, Any]]:
         """Load one bounded discussion projection for terminal reconstruction."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 f"SELECT {_ROOM_EVENT_COLUMNS} FROM hosted_room_events WHERE room_id=? AND seq=?",
                 (room_id, source_event_seq)).fetchone()
@@ -359,7 +377,7 @@ class HostedRoomPolicyCheckpoint:
 
     def compact_completed(self, *, room_id: str) -> None:
         """Drop any completed projections left by an interrupted sync."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             for row in conn.execute(
                 "SELECT discussion_event_id FROM hosted_room_policy_threads WHERE room_id=? AND completed=1", (room_id,)
             ).fetchall():

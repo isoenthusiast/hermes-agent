@@ -94,9 +94,13 @@ def clock(now: float | None) -> float:
     return time.time() if now is None else float(now)
 
 
-def open_sqlite(path: DbPath, *, timeout: float = 10) -> sqlite3.Connection:
-    """Row-factory connection with foreign keys on; no journal or schema work."""
-    conn = sqlite3.connect(path, timeout=timeout)
+def open_sqlite(path: DbPath, *, timeout: float = 10, read_only: bool = False) -> sqlite3.Connection:
+    """Row-factory connection with foreign keys on; no journal or schema work.
+
+    ``read_only`` opens the store ``mode=ro``: for readers that must not be able to
+    write, and must not hold a write handle on a store another process owns.
+    """
+    conn = sqlite3.connect(f"file:{path}?mode=ro" if read_only else path, timeout=timeout, uri=read_only)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
