@@ -249,6 +249,22 @@ def _sibling_repo_named_in_prose(
 _REPO_PATH_PATTERN = re.compile(r"""(?:^|[\s(=\\"'`])(?P<path>(?:~/|/|\$HOME(?:/|$))[^\s,;)"'`]+)""")
 
 
+def _is_dir_stat_safe(p: Path) -> bool:
+    """``Path.is_dir()`` that reads an unstat-able path as "not a directory".
+
+    ``is_dir()`` maps EACCES to a raise, but the walk-up below only needs the
+    nearest *existing* ancestor, so an unreadable level must advance to its
+    parent. A card body may quote a path under a directory this process cannot
+    traverse (`/root/.hermes/...` from a card about credentials), and the raise
+    would otherwise abort the dispatcher's whole board tick before any worker
+    spawned (measured: t_3c7928ec — every tick re-claimed and died).
+    """
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 def _card_repo_anchor(
     title: Optional[str],
     body: Optional[str],
@@ -282,7 +298,7 @@ def _card_repo_anchor(
         # `git -C <file>` fails, and the card would otherwise fall through to
         # the board default and anchor a worktree on the wrong repo.
         p = Path(expanded)
-        while p != p.parent and not p.is_dir():
+        while p != p.parent and not _is_dir_stat_safe(p):
             p = p.parent
         top = _kbw._git_toplevel(p)
         if top is not None:
@@ -1919,8 +1935,10 @@ def _dispatch_lane_task(
     # `scratch` that references a git repo is auto-upgraded to an isolated
     # per-task worktree so concurrent workers never share a checkout. Applies to
     # both the ready and review lanes.
-    claimed = _maybe_upgrade_repo_scratch(conn, claimed, board=board)
     try:
+        # Inside the guard: a defect in the anchor/upgrade path must fail THIS
+        # card (auto-block after failure_limit), never the board's whole tick.
+        claimed = _maybe_upgrade_repo_scratch(conn, claimed, board=board)
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)

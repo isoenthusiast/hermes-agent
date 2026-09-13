@@ -423,3 +423,46 @@ def test_backtick_wrapped_path_beats_the_board_default(kanban_home, tmp_path):
     finally:
         conn.close()
 
+
+def test_unreadable_absolute_path_in_prose_does_not_kill_the_tick(kanban_home, tmp_path):
+    """Invariant: resolving the anchor must never raise on an unstat-able path.
+
+    A card body may quote a path under a directory this process cannot traverse
+    (`/root/.hermes/...` from a card about credentials). The walk-up exists only
+    to find the nearest existing ancestor — an unreadable path must advance to
+    its parent, not abort the dispatcher's whole tick. Measured: t_3c7928ec,
+    where `Path.is_dir()` raised EACCES inside `_card_repo_anchor`, the tick died
+    before any worker spawned, and the card re-claimed every 15 min forever.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "google_token.json").write_text("{}")
+    locked.chmod(0o000)
+    try:
+        # No repo is reachable from here, so the correct answer is "no anchor" —
+        # but the decisive part is that this returns at all instead of raising.
+        assert kbd._card_repo_anchor(
+            "t", f"the dispatcher stats {locked}/google_token.json and dies", board=None,
+        ) is None
+    finally:
+        locked.chmod(0o700)
+
+
+def test_scratch_card_quoting_an_unreadable_path_stays_scratch(kanban_home, tmp_path):
+    """End-to-end: the upgrade path survives the same card shape intact."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "google_token.json").write_text("{}")
+    locked.chmod(0o000)
+    try:
+        conn = kbc.connect()
+        try:
+            tid = _mk(conn, body=f"see {locked}/google_token.json for the token")
+            task = kb.get_task(conn, tid)
+            upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+            assert upgraded.workspace_kind == "scratch"
+        finally:
+            conn.close()
+    finally:
+        locked.chmod(0o700)
+
