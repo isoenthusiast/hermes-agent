@@ -630,6 +630,68 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+# Columns every Hermes task store has carried since the schema's first release
+# (c868425467). Deliberately the same set ``_not_a_store()`` checks in
+# ~/.hermes/scripts/kanban_card_lint.py: one fleet-wide rule for "this file is
+# not a board", so the dispatcher's skip reason and the linter's skip reason can
+# never drift apart.
+#
+# Kept to the first-release columns ON PURPOSE. A wider set (every base column
+# the additive migration cannot supply, e.g. ``claim_lock``) would refuse a real
+# board as soon as a future release adds a base column without an additive
+# entry — the same authoring slip that left ``claim_lock`` out of the additive
+# lists. A store that passes this shape test but still cannot migrate stays a
+# reported per-board fault (once, not per tick), never a false "not a store".
+_BASELINE_TASK_COLUMNS = ("id", "title", "body", "created_by", "status", "created_at")
+
+
+class KanbanDbNotATaskStoreError(Exception):
+    """``kanban.db`` exists but its ``tasks`` table is not a Hermes task store.
+
+    Raised by :func:`connect` BEFORE the schema/migration pass writes anything,
+    so a foreign SQLite file parked under ``boards/<slug>/`` (an audit fixture, a
+    stray copy) is refused intact instead of being half-migrated: the migration's
+    additive ``ALTER TABLE``s cannot rebuild the columns such a file is missing,
+    so the backfill at the end of the pass aborted on every connect and every
+    board tick logged the same traceback forever.
+
+    Callers that sweep many boards (the gateway dispatcher, the card linter) skip
+    and NAME it. A caller that asked for this board explicitly gets an actionable
+    error instead of an ``OperationalError`` from deep inside the backfill.
+    """
+
+
+def _not_a_task_store(conn: sqlite3.Connection) -> Optional[str]:
+    """None when *conn* reads as a Hermes task store, else a short reason why not.
+
+    Only a shape defect this can PROVE refuses a store: a ``tasks`` table missing
+    a baseline column (the audit harness's 4-column fixture board). No ``tasks``
+    table at all is a fresh/empty file — SCHEMA_SQL creates it, unchanged. Same
+    discipline (and same reason wording) as ``_not_a_store()`` in
+    ~/.hermes/scripts/kanban_card_lint.py.
+    """
+    if not _table_exists(conn, "tasks"):
+        return None
+    missing = sorted(set(_BASELINE_TASK_COLUMNS) - _column_names(conn, "tasks"))
+    if missing:
+        # Same wording as kanban_card_lint.py's _not_a_store() on purpose: the
+        # dispatcher's skip reason and the linter's are one string to grep.
+        return f"tasks lacks {','.join(missing)}"
+    return None
+
+
+def _not_a_task_store_error(
+    conn: sqlite3.Connection, path: Path,
+) -> Optional[KanbanDbNotATaskStoreError]:
+    """The refusal *path* earns, or None when it reads as a Hermes task store."""
+    reason = _not_a_task_store(conn)
+    if reason is None:
+        return None
+    return KanbanDbNotATaskStoreError(
+        f"{path} is not a kanban task store ({reason})"
+    )
+
+
 def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     """Open ``path`` with the kanban PRAGMA set, then run ``under_lock(conn)``.
     WAL activation and ``under_lock`` share the ``_INIT_LOCK`` critical section:
@@ -681,6 +743,10 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
         if not _schema_is_present(conn):
             conn.close()
             raise PermissionError("Kanban descendants require an initialized board; ask its owner to initialize it")
+        refusal = _not_a_task_store_error(conn, path)
+        if refusal is not None:
+            conn.close()
+            raise refusal
         return conn
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -725,6 +791,12 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
+                # Prove the shape BEFORE writing: a file that is not a board is
+                # refused untouched instead of being half-migrated on every
+                # connect (see KanbanDbNotATaskStoreError).
+                refusal = _not_a_task_store_error(conn, path)
+                if refusal is not None:
+                    raise refusal
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)

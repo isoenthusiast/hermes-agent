@@ -29,6 +29,11 @@ def _kbd():
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
+def _suppressed_tail(suppressed: int) -> str:
+    """Suffix for a fault message that has been repeating silently."""
+    return f" ({suppressed} identical tick(s) suppressed since the last report)" if suppressed else ""
+
+
 @dataclass
 class _DispatcherSettings:
     """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
@@ -132,6 +137,13 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # slug -> (fault key, repeats suppressed). A board the dispatcher cannot
+        # open is news ONCE: the same failure re-logged every 60 s trains the
+        # operator to ignore the log. Keyed on the fault itself — a different
+        # failure speaks up again, and a tick that succeeds clears the slot, so
+        # keying on the file's mtime (which the refused open itself can move)
+        # cannot resurrect the pulse.
+        self.reported_board_faults: dict[str, tuple[str, int]] = {}
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -170,6 +182,22 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
+    def _report_board_fault(self, slug: str, fault_key: str, render) -> None:
+        """Report a per-board fault at most once per *fault_key*; else count it.
+
+        ``render(prior_suppressed)`` emits the message. A repeat of the same
+        fault only bumps a counter: a board that cannot be opened does not change
+        by being retried 1440 times a day, and a line per tick buries the faults
+        that DO change. ``tick_once_for_board`` clears the slot on a tick that
+        works, so a fault that comes back after a recovery is news again.
+        """
+        prev = self.reported_board_faults.get(slug)
+        if prev is not None and prev[0] == fault_key:
+            self.reported_board_faults[slug] = (fault_key, prev[1] + 1)
+            return
+        self.reported_board_faults[slug] = (fault_key, 0)
+        render(prev[1] if prev is not None else 0)
+
     def tick_once_for_board(self, slug: str) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
@@ -185,7 +213,7 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            result = _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -198,12 +226,37 @@ class _KanbanDispatcher:
                     slug, fingerprint[0],
                 )
                 return None
-            logger.exception("kanban dispatcher: tick failed on board %s", slug)
+            if isinstance(exc, _kbc().KanbanDbNotATaskStoreError):
+                # Not a board at all (a fixture/foreign SQLite file parked under
+                # boards/<slug>/). Nothing the dispatcher can do makes it one, so
+                # name it once and keep ticking the other boards.
+                self._report_board_fault(
+                    slug, f"not-a-task-store:{exc}",
+                    lambda prior: logger.error(
+                        "kanban dispatcher: board %s is not a kanban task store, "
+                        "skipping dispatch for it (%s). Move the file aside if it is "
+                        "not a board; `hermes kanban init --board %s` then creates "
+                        "one.%s",
+                        slug, exc, slug, _suppressed_tail(prior),
+                    ),
+                )
+                return None
+            self._report_board_fault(
+                slug, f"tick-error:{type(exc).__name__}:{exc}",
+                lambda prior: logger.error(
+                    "kanban dispatcher: tick failed on board %s%s",
+                    slug, _suppressed_tail(prior), exc_info=exc,
+                ),
+            )
             return None
         finally:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+        # The tick worked, so whatever fault this board last reported is over:
+        # the next occurrence is news again, not a suppressed repeat.
+        self.reported_board_faults.pop(slug, None)
+        return result
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
