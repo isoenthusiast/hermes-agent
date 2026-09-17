@@ -466,3 +466,191 @@ def test_scratch_card_quoting_an_unreadable_path_stays_scratch(kanban_home, tmp_
     finally:
         locked.chmod(0o700)
 
+
+# ---------------------------------------------------------------------------
+# Title scope vs prose order (card t_31a9fee9). Two cards dispatched 2026-09-18
+# anchored on a repo they do not edit, because the first *resolvable* prose path
+# token won: t_c788df73 (`littlepanda: ...`) landed on
+# /srv/hermes/workspaces/ellen-production, and t_eaa1a1f7 (`ellen-production: ...`)
+# landed on /home/edward/.orrery — both titles open with the repo they edit, so
+# the title's scope word is the lever that gets these right.
+# ---------------------------------------------------------------------------
+
+
+def test_title_scope_beats_the_first_prose_token(kanban_home, tmp_path):
+    """Frame-for-frame t_c788df73: the card is about littlepanda and quotes the
+    *retired* ellen-production path first, so the first resolvable token names a
+    repo the card does not own. The title's `littlepanda:` scope must win, and the
+    displacement must be recorded."""
+    ws = tmp_path / "workspace"
+    ellen = _make_git_repo(ws, "ellen-production")
+    panda = _make_git_repo(ws, "littlepanda")
+    gone = tmp_path / "gone" / "ellen-production"      # the retired path: not on disk
+    assert not gone.exists()
+    conn = kbc.connect()
+    try:
+        tid = _mk(
+            conn,
+            title=(
+                "littlepanda: load_quizzes.py + make_book_frames.py still reach "
+                f"into the retired {gone} path"
+            ),
+            body=(
+                f"- load_quizzes.py:8 -> {ellen}/platform/static/book_frames\n"
+                f"- make_book_frames.py:8 -> {panda}/packs\n"
+            ),
+        )
+        task = kb.get_task(conn, tid)
+
+        upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+
+        assert Path(upgraded.workspace_path).resolve() == Path(panda).resolve()
+        payloads = _payloads(conn, tid, "workspace_upgraded_to_worktree")
+        assert payloads[0]["anchor_source"] == kbd.ANCHOR_SOURCE_PROSE
+        assert payloads[0]["repo"] == str(Path(panda).resolve())
+
+        overrides = _payloads(conn, tid, "workspace_anchor_scope_override")
+        assert len(overrides) == 1
+        assert overrides[0]["repo"] == str(Path(panda).resolve())
+        assert overrides[0]["title_scope"] == "littlepanda"
+        assert overrides[0]["first_prose_candidate"] == str(Path(ellen).resolve())
+        assert overrides[0]["first_prose_path"] == f"{ellen}/platform/static/book_frames"
+    finally:
+        conn.close()
+
+
+def test_scope_word_naming_no_candidate_keeps_the_prose_order(kanban_home, tmp_path):
+    """A lane word that is not a repo name (`box:`, `fleet:`, `conan:`) must change
+    nothing — prose order still decides, and no override is reported."""
+    ws = tmp_path / "workspace"
+    sams = _make_git_repo(ws, "sams-app")
+    plant = _make_git_repo(ws, "gamified-plant")
+    conn = kbc.connect()
+    try:
+        tid = _mk(
+            conn,
+            title="box: audit both apps",
+            body=f"start in {sams}/src, then {plant}/src",
+        )
+        task = kb.get_task(conn, tid)
+
+        upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+
+        assert Path(upgraded.workspace_path).resolve() == Path(sams).resolve()
+        assert _payloads(conn, tid, "workspace_anchor_scope_override") == []
+    finally:
+        conn.close()
+
+
+def test_scope_word_matches_a_repo_name_only_as_a_whole_word(kanban_home, tmp_path):
+    """`littlepanda-old:` must not select `littlepanda` — the same word-boundary
+    rule `_prose_names_repo` already uses for `sams-app-old` vs `sams-app`."""
+    ws = tmp_path / "workspace"
+    panda = _make_git_repo(ws, "littlepanda")
+    other = _make_git_repo(ws, "othello-trainer-concept")
+    conn = kbc.connect()
+    try:
+        tid = _mk(
+            conn,
+            title=f"littlepanda-old: sweep {other}",
+            body=f"start with {other}/a.py, then {panda}/b.py",
+        )
+        task = kb.get_task(conn, tid)
+
+        upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+
+        assert Path(upgraded.workspace_path).resolve() == Path(other).resolve()
+        assert _payloads(conn, tid, "workspace_anchor_scope_override") == []
+    finally:
+        conn.close()
+
+
+def test_scope_matching_the_first_candidate_is_not_an_override(kanban_home, tmp_path):
+    """When the title's scope word names the repo prose order already picked, the
+    pick is unchanged and nothing is flagged — the override event is for a
+    displacement only, not for agreement."""
+    ws = tmp_path / "workspace"
+    panda = _make_git_repo(ws, "littlepanda")
+    ellen = _make_git_repo(ws, "ellen-production")
+    conn = kbc.connect()
+    try:
+        tid = _mk(
+            conn,
+            title=f"littlepanda: sweep {panda} and {ellen}",
+            body=f"start in {panda}/a.py, then {ellen}/b.py",
+        )
+        task = kb.get_task(conn, tid)
+
+        upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+
+        assert Path(upgraded.workspace_path).resolve() == Path(panda).resolve()
+        assert _payloads(conn, tid, "workspace_anchor_scope_override") == []
+    finally:
+        conn.close()
+
+
+def test_scope_match_stops_at_the_first_same_named_clone(kanban_home, tmp_path):
+    """The same repo often exists at more than one path (canonical checkout plus a
+    bot's `.hermes/profiles/<bot>/workspace/<repo>` clone). When the prose-order
+    pick already carries the title's scope name, the rule must not scan past it to
+    a later clone — measured on real cards t_4996a046 and t_4b45bd45, where a
+    look-past loop moved the anchor from the canonical `littlepanda` to a clone."""
+    ws = tmp_path / "workspace"
+    canonical = _make_git_repo(ws, "littlepanda")
+    clone = _make_git_repo(tmp_path / "bots" / "ellen", "littlepanda")
+    assert Path(canonical).name == Path(clone).name == "littlepanda"
+    conn = kbc.connect()
+    try:
+        tid = _mk(
+            conn,
+            title="littlepanda: commit the two-file retired-path fix",
+            body=f"draft in {canonical}/packs, mirror into {clone}/packs",
+        )
+        task = kb.get_task(conn, tid)
+
+        upgraded = kbd._maybe_upgrade_repo_scratch(conn, task, board=None)
+
+        assert Path(upgraded.workspace_path).resolve() == Path(canonical).resolve()
+        assert _payloads(conn, tid, "workspace_anchor_scope_override") == []
+    finally:
+        conn.close()
+
+
+def test_anchor_records_the_displaced_candidate(kanban_home, tmp_path):
+    """Unit shape of the lever: the winning token is kept as ``prose_path`` and the
+    displaced first candidate as ``overrode_repo``/``overrode_prose_path``."""
+    ws = tmp_path / "workspace"
+    ellen = _make_git_repo(ws, "ellen-production")
+    panda = _make_git_repo(ws, "littlepanda")
+
+    overridden = kbd._card_repo_anchor(
+        "littlepanda: the sweep",
+        f"first {ellen}/platform, then {panda}/packs",
+        board=None,
+    )
+    assert overridden is not None
+    assert Path(overridden.repo).resolve() == Path(panda).resolve()
+    assert overridden.prose_path == f"{panda}/packs"
+    assert overridden.title_scope == "littlepanda"
+    assert Path(overridden.overrode_repo).resolve() == Path(ellen).resolve()
+    assert overridden.overrode_prose_path == f"{ellen}/platform"
+
+    # Control: no scope word, so the first resolvable token stands and nothing is
+    # recorded as an override.
+    plain = kbd._card_repo_anchor("the sweep", f"first {ellen}/platform, then {panda}/packs", board=None)
+    assert plain is not None
+    assert Path(plain.repo).resolve() == Path(ellen).resolve()
+    assert plain.title_scope is None
+    assert plain.overrode_repo is None
+
+
+def test_title_scope_word_reads_the_leading_lane(kanban_home, tmp_path):
+    """The scope is the word that abuts the title's first colon, any case."""
+    assert kbd._title_scope_word("littlepanda: load_quizzes.py") == "littlepanda"
+    assert kbd._title_scope_word("  ellen-production: 105 files") == "ellen-production"
+    assert kbd._title_scope_word("LittlePanda: sweep") == "LittlePanda"
+    # A date-prefixed lane (`fleet-delta 2026-09-18: ...`) declares no scope word.
+    assert kbd._title_scope_word("fleet-delta 2026-09-18: the verifier gate") is None
+    assert kbd._title_scope_word("no colon here") is None
+    assert kbd._title_scope_word(None) is None
+

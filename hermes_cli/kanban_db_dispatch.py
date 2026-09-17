@@ -193,11 +193,32 @@ class _RepoAnchor(NamedTuple):
     so the caller can tell a live path from one that is gone — a card whose prose
     points into a *sibling card's deleted worktree* resolves through its enclosing
     repo, which is how one card silently anchored on the wrong repo entirely.
+
+    ``title_scope`` / ``overrode_repo`` are set only when the title's scope word
+    (``littlepanda: ...``) decided *against* the first prose path token, so the
+    caller can record a deliberate override rather than a silent first-token pick.
     """
 
     repo: Path
     source: str
     prose_path: Optional[str] = None
+    title_scope: Optional[str] = None
+    overrode_repo: Optional[Path] = None
+    overrode_prose_path: Optional[str] = None
+
+
+# The board's authoring convention: a card title opens with the lane/project the
+# card belongs to (`littlepanda: ...`, `ellen-production: ...`, `box: ...`). The
+# word before the first colon is the scope its author declared.
+_TITLE_SCOPE_PATTERN = re.compile(r"^\s*(?P<scope>[A-Za-z0-9][\w.+-]*)\s*:")
+
+
+def _title_scope_word(title: Optional[str]) -> Optional[str]:
+    """The lane/project word a card title declares before its colon, else ``None``."""
+    if not title:
+        return None
+    m = _TITLE_SCOPE_PATTERN.match(title)
+    return m.group("scope") if m else None
 
 
 def _prose_names_repo(title: Optional[str], body: Optional[str], repo: Path) -> bool:
@@ -265,22 +286,19 @@ def _is_dir_stat_safe(p: Path) -> bool:
         return False
 
 
-def _card_repo_anchor(
-    title: Optional[str],
-    body: Optional[str],
-    board: Optional[str] = None,
-) -> "Optional[_RepoAnchor]":
-    """Return a git repo root the card references, with the lever that found it.
+def _prose_repo_candidates(
+    title: Optional[str], body: Optional[str],
+) -> "list[tuple[Path, str]]":
+    """Every distinct git repo the card prose names, as ``(repo, path token)``.
 
-    Every absolute / ~-prefixed path token in the card prose is expanded and
-    checked with ``git rev-parse --show-toplevel`` (via ``_kbw._git_toplevel``);
-    the first that names a git repo wins (``source=ANCHOR_SOURCE_PROSE``). Only
-    when the prose resolves nothing does the board's ``default_workdir`` decide
-    (``source=ANCHOR_SOURCE_BOARD_DEFAULT``) — the caller must treat that as a
-    guess, because a card targeting a sibling repo names it in prose only, and
-    a bare repo name is not a path token.
+    First-mention order, deduplicated by resolved repo root. A card that names
+    more than one repo is the shape one path token cannot decide alone — the
+    title's scope word is the tiebreaker (``_card_repo_anchor``), and prose order
+    is the fallback that used to be the only lever.
     """
     text = f"{title or ''}\n{body or ''}"
+    out: "list[tuple[Path, str]]" = []
+    seen: "set[Path]" = set()
     for m in _REPO_PATH_PATTERN.finditer(text):
         raw = m.group("path")
         expanded = os.path.expandvars(os.path.expanduser(raw))
@@ -301,8 +319,64 @@ def _card_repo_anchor(
         while p != p.parent and not _is_dir_stat_safe(p):
             p = p.parent
         top = _kbw._git_toplevel(p)
-        if top is not None:
-            return _RepoAnchor(top, ANCHOR_SOURCE_PROSE, expanded)
+        if top is None or top in seen:
+            continue
+        seen.add(top)
+        out.append((top, expanded))
+    return out
+
+
+def _card_repo_anchor(
+    title: Optional[str],
+    body: Optional[str],
+    board: Optional[str] = None,
+) -> "Optional[_RepoAnchor]":
+    """Return a git repo root the card references, with the lever that found it.
+
+    Every absolute / ~-prefixed path token in the card prose is expanded and
+    checked with ``git rev-parse --show-toplevel`` (via ``_kbw._git_toplevel``).
+    One distinct repo resolves, that repo wins. Several do, and prose order is
+    not trustworthy: a card about littlepanda whose body quotes a retired
+    ``/home/edward/ellen-production`` path first anchored its worktree on
+    ellen-production (measured: t_c788df73, which edits littlepanda), and a card
+    about ellen-production anchored on ``/home/edward/.orrery`` (t_eaa1a1f7).
+    Both titles open with the repo they belong to, so the title's scope word
+    decides *when it names one of the candidates*; otherwise prose order stands.
+    All of these are ``source=ANCHOR_SOURCE_PROSE``.
+
+    Only when the prose resolves nothing does the board's ``default_workdir``
+    decide (``source=ANCHOR_SOURCE_BOARD_DEFAULT``) — the caller must treat that
+    as a guess, because a card targeting a sibling repo names it in prose only,
+    and a bare repo name is not a path token.
+    """
+    candidates = _prose_repo_candidates(title, body)
+    if candidates:
+        repo, prose_path = candidates[0]
+        scope = _title_scope_word(title)
+        overrode_repo: Optional[Path] = None
+        overrode_prose_path: Optional[str] = None
+        if scope:
+            for idx, (cand_repo, cand_path) in enumerate(candidates):
+                if not _prose_names_repo(scope, None, cand_repo):
+                    continue
+                # The first repo the title's scope names wins the tie; when that is
+                # already the prose-order pick, nothing was displaced. The scan
+                # stops at the first *match*, never looking past it: a repo that
+                # exists at two paths (canonical checkout + a bot's
+                # .hermes/profiles/<bot>/workspace/<repo> clone) would otherwise
+                # hand the anchor to the later clone on the same basename.
+                if idx:
+                    overrode_repo, overrode_prose_path = repo, prose_path
+                    repo, prose_path = cand_repo, cand_path
+                break
+        return _RepoAnchor(
+            repo,
+            ANCHOR_SOURCE_PROSE,
+            prose_path,
+            title_scope=scope if overrode_repo is not None else None,
+            overrode_repo=overrode_repo,
+            overrode_prose_path=overrode_prose_path,
+        )
     if board:
         default_workdir = (_kb.read_board_metadata(board).get("default_workdir") or "").strip()
         if default_workdir:
@@ -355,7 +429,10 @@ def _maybe_upgrade_repo_scratch(
     A prose anchor is not automatically trustworthy either: when the path the card
     names is gone from disk (a sibling card's deleted worktree is the common case)
     the anchor resolves through its enclosing repo, so a
-    ``workspace_anchor_unverified`` event records that too.
+    ``workspace_anchor_unverified`` event records that too. And when the card's
+    prose names more than one repo, the title's scope word (`littlepanda: ...`)
+    picks between them; a ``workspace_anchor_scope_override`` event records that
+    the first prose path token was displaced.
     """
     if (task.workspace_kind or "scratch") != "scratch":
         return task
@@ -395,6 +472,12 @@ def _maybe_upgrade_repo_scratch(
         if anchor.source == ANCHOR_SOURCE_PROSE
         else None
     )
+    # The title's scope word is a statement of what the card edits, so when it beat
+    # the first prose path token the pick is deliberate — and recorded, because a
+    # title that names the wrong repo would otherwise only show up in the
+    # workspace path (measured: t_c788df73 anchored on ellen-production, t_eaa1a1f7
+    # on /home/edward/.orrery — both titles named the repo they actually edit).
+    scope_override = anchor.overrode_repo is not None
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? "
@@ -442,6 +525,22 @@ def _maybe_upgrade_repo_scratch(
                               "workspace_path on the card",
                 },
             )
+        if scope_override:
+            _kb._append_event(
+                conn, task.id, "workspace_anchor_scope_override",
+                {
+                    "repo": str(anchor.repo),
+                    "branch": branch,
+                    "anchor_source": anchor.source,
+                    "title_scope": anchor.title_scope,
+                    "first_prose_candidate": str(anchor.overrode_repo),
+                    "first_prose_path": anchor.overrode_prose_path,
+                    "reason": "the card's title declares the repo it belongs to and its "
+                              "prose names more than one repo; the title's repo won over "
+                              "the first prose path token — verify it is the repo the "
+                              "card edits",
+                },
+            )
     refreshed = _kb.get_task(conn, task.id)
     _kb._log.info(
         "kanban dispatch: upgraded %s from scratch to worktree on %s (%s, "
@@ -462,6 +561,13 @@ def _maybe_upgrade_repo_scratch(
             "anchored to its enclosing repo %s; the worktree may sit on the wrong "
             "repo; pin workspace_path on the card",
             task.id, gone_worktree, anchor.repo,
+        )
+    if scope_override:
+        _kb._log.warning(
+            "kanban dispatch: %s anchored to %s on the title's scope `%s:` — the "
+            "card's prose names more than one repo and its first path token named "
+            "%s; verify the title's repo is the one the card edits",
+            task.id, anchor.repo, anchor.title_scope, anchor.overrode_repo,
         )
     return refreshed or task
 
