@@ -6,6 +6,12 @@ the supervisor revives it, auto-resume re-runs the turn: a SIGTERM-respawn loop.
 ``cron.jobs.create_job`` rejects such specs on every creation path. Patterns are command-shaped —
 anchored on concrete command identifiers — so they cannot fire on prose. Defence-in-depth layer.
 
+A ``case`` alternative list is not a command list. ``case "$t" in /a/state.db|/a/state.db-wal)``
+lists *patterns*, so its alternatives are dropped before command segmentation; the ``case`` word and
+the bodies between ``)`` and ``;;`` are still scanned. Splitting such a list on ``|`` put each literal
+pattern at command position, so the referenced-script walk read an 843-MiB SQLite database as a
+"referenced script" and failed closed on its size — refusing a benign read-only command (#2).
+
 A refusal carries its reason. ``explain_gateway_lifecycle_refusal`` returns a ``LifecycleRefusal``
 naming the condition that failed — the matched text, the path and its size, the exhausted budget —
 instead of a bare bool, so a refusal can never read as "a lifecycle command was found" when the
