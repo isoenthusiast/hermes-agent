@@ -5,6 +5,18 @@ A cron job that restarts/stops the gateway from inside the gateway (``hermes gat
 the supervisor revives it, auto-resume re-runs the turn: a SIGTERM-respawn loop.
 ``cron.jobs.create_job`` rejects such specs on every creation path. Patterns are command-shaped —
 anchored on concrete command identifiers — so they cannot fire on prose. Defence-in-depth layer.
+
+A refusal carries its reason. ``explain_gateway_lifecycle_refusal`` returns a ``LifecycleRefusal``
+naming the condition that failed — the matched text, the path and its size, the exhausted budget —
+instead of a bare bool, so a refusal can never read as "a lifecycle command was found" when the
+trigger was a quoted string, an oversized data file, or a scan cap (#2). Verdicts are unchanged:
+naming the condition is diagnostic, and the guard stays blunt (a quoted match still blocks).
+
+Condition slugs: ``gateway_lifecycle_command`` (matched at a command position),
+``gateway_lifecycle_text`` (matched only as inert text: quoted, spliced, or an argv list),
+``launchctl_submit``, ``cloud_placeholder_path``, ``oversized_referenced_script``,
+``non_regular_referenced_path``, ``unreadable_referenced_script``, ``scan_budget_exhausted``,
+``recursion_depth_exceeded``.
 """
 
 from __future__ import annotations
@@ -14,6 +26,7 @@ import os
 import re
 import shlex
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -22,6 +35,29 @@ logger = logging.getLogger(__name__)
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+@dataclass(frozen=True)
+class LifecycleRefusal:
+    """Which condition failed, and the evidence for it.
+
+    ``condition`` is a stable slug (see the module docstring); ``detail`` states the specific
+    evidence in words — the matched text, the path together with its size, the exhausted limit.
+    """
+
+    condition: str
+    detail: str
+
+
+LIFECYCLE_COMMAND_CONDITION = "gateway_lifecycle_command"
+LIFECYCLE_TEXT_CONDITION = "gateway_lifecycle_text"
+LAUNCHCTL_SUBMIT_CONDITION = "launchctl_submit"
+CLOUD_PATH_CONDITION = "cloud_placeholder_path"
+OVERSIZED_SCRIPT_CONDITION = "oversized_referenced_script"
+NON_REGULAR_PATH_CONDITION = "non_regular_referenced_path"
+UNREADABLE_SCRIPT_CONDITION = "unreadable_referenced_script"
+BUDGET_CONDITION = "scan_budget_exhausted"
+DEPTH_CONDITION = "recursion_depth_exceeded"
 
 
 # Shell-level command shapes that target the gateway lifecycle; each branch is anchored on a
@@ -386,13 +422,38 @@ def lifecycle_scan_root_within_budget(text: str) -> bool:
         return False
 
 
-def _budget_exhausted(what: str, depth: int) -> bool:
+# Which limits each budget name is made of, so an exhausted budget can quote the real numbers
+# instead of saying "something was too big".
+_BUDGET_LIMIT_CONSTANTS = {
+    "text": (
+        "_MAX_LIFECYCLE_SCAN_BYTES",
+        "_MAX_LIFECYCLE_SCAN_LINES",
+        "_MAX_LIFECYCLE_SCAN_LINE_BYTES",
+    ),
+    "paths": ("_MAX_LIFECYCLE_SCAN_PATHS",),
+    "remote reads": ("_MAX_LIFECYCLE_SCAN_REMOTE_READS",),
+}
+
+
+def _budget_exhausted(what: str, depth: int) -> LifecycleRefusal:
+    """Refuse (fail closed) when a work budget is spent, naming the limit that bound it.
+
+    Exhaustion is a verdict, not a verdict-free signal: text that never reached the tokenizer cannot
+    be certified free of a lifecycle command, so the command is refused. The refusal quotes the
+    capped quantity, so an operator can tell a real block from a cap that is simply too tight.
+    """
+    constants = _BUDGET_LIMIT_CONSTANTS.get(what, ())
+    limits = ", ".join(f"{name}={globals().get(name)}" for name in constants) or what
     logger.warning(
         "lifecycle guard scan budget exhausted (%s at depth %d); "
         "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
         what, depth,
     )
-    return True
+    return LifecycleRefusal(
+        BUDGET_CONDITION,
+        f"the walk's {what} budget is exhausted at depth {depth} ({limits}), so the unscanned "
+        f"remainder cannot be certified free of a lifecycle command",
+    )
 
 
 # --- shell tokenization -----------------------------------------------------------------------
@@ -447,20 +508,83 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
         yield segment
 
 
+def _strip_case_pattern_list(tokens: list[str], state: list[bool]) -> list[str]:
+    """Drop the alternative list of a shell ``case`` statement, keeping every other token.
+
+    ``case "$t" in /a/state.db|/a/state.db-wal)`` executes nothing in that list: ``/a/state.db`` is
+    a *pattern* and the ``|`` separates patterns, not pipelines. Splitting on that ``|`` put each
+    literal pattern at command position, so the referenced-script walk read a 843-MiB SQLite
+    database as a "referenced script", failed closed on its size, and refused a benign read-only
+    command (#2 — measured: the walk yielded ``/home/edward/.hermes/state.db``, size 882827264,
+    ``read_unsafe=True``). Dropping the region removes an over-approximation, not a control:
+
+    * a pattern list holds no executable text — the shell cannot run anything from it;
+    * the ``case`` *word* is still scanned, and the bodies between ``)`` and ``;;`` are ordinary
+      command segments, so a lifecycle command in a case body is still refused;
+    * the raw-text pass in ``contains_gateway_lifecycle_command`` still sees this text, so a literal
+      lifecycle command written inside a pattern list is still blocked.
+
+    *state* carries ``[pending_in, in_patterns]`` across logical lines: the reporter's shape puts
+    ``case "$t" in`` and the alternative list on different lines.
+    """
+    pending_in, in_patterns = state
+    kept: list[str] = []
+    at_command_start = True
+    for token in tokens:
+        is_control = bool(token) and set(token) <= _CONTROL_CHARS
+        if in_patterns:
+            # Inside the list: drop the patterns and their `|` separators. The closing `)` is KEPT:
+            # it terminates the list and it is also the segment boundary that keeps the case BODY a
+            # command (`case $t in x) /path/body.sh`) — dropping it merged the body into the case-word
+            # segment, where token 0 is `case` and the body's command was never scanned.
+            if ")" in token:
+                in_patterns = False
+                kept.append(token)
+            elif is_control and token not in ("|", "||", "("):
+                # A command separator cannot occur inside a pattern list: the input is malformed, so
+                # stop dropping here rather than swallow the rest of the command.
+                in_patterns = False
+                kept.append(token)
+            continue
+        if pending_in:
+            if token == "in":
+                pending_in = False
+                in_patterns = True
+                continue
+            if is_control:
+                # A control operator between `case` and `in` means this was not a case statement.
+                pending_in = False
+                kept.append(token)
+                at_command_start = True
+                continue
+        kept.append(token)
+        # Only a `case` in COMMAND position arms the state machine: `grep -n case in file` mentions
+        # the words, and arming there would drop every following token up to some unrelated `)` —
+        # i.e. it could hide a real script reference later on the same command text.
+        if at_command_start and token == "case":
+            pending_in = True
+        at_command_start = is_control
+    state[:] = [pending_in, in_patterns]
+    return kept
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments per logical line; a line shlex rejects (unbalanced
-    quotes) falls back to per-physical-line tokenization."""
+    quotes) falls back to per-physical-line tokenization. ``case`` alternative lists are dropped —
+    see ``_strip_case_pattern_list`` for why that is a narrowing, not a weakening."""
+    case_state = [False, False]
     for line in _split_logical_lines(command.replace("\\\n", "")):
         try:
             tokens = _shlex_tokens(line)
         except ValueError:
             for physical_line in line.splitlines():
                 try:
-                    yield from _split_segments(_shlex_tokens(physical_line))
+                    tokens = _shlex_tokens(physical_line)
                 except ValueError:
                     continue
+                yield from _split_segments(_strip_case_pattern_list(tokens, case_state))
             continue
-        yield from _split_segments(tokens)
+        yield from _split_segments(_strip_case_pattern_list(tokens, case_state))
 
 
 def _executable_name(token: str) -> str:
@@ -586,6 +710,84 @@ def _direct_lifecycle_scan(command: str) -> bool:
         _lifecycle_command_scan_with_data_exemption(command)
         or contains_launchctl_submit_command(command)
     )
+
+
+def _inside_quoted_span(text: str, index: int) -> bool:
+    """True when *index* falls inside a single- or double-quoted shell literal."""
+    in_single = in_double = escape = False
+    for char in text[:index]:
+        if escape:
+            escape = False
+        elif char == "\\" and not in_single:
+            escape = True
+        elif char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+    return in_single or in_double
+
+
+def _describe_direct_refusal(command: str) -> LifecycleRefusal:
+    """Name which direct scan matched, after ``_direct_lifecycle_scan(command)`` returned True.
+
+    ``gateway_lifecycle_command`` and ``gateway_lifecycle_text`` are one verdict with two audiences.
+    A match at a command position is an action to stop; a match inside a quoted string is *text*,
+    and saying so is the actionable half — the operator's fix is to describe the operation by role
+    instead of quoting the literal command in scanned tool input, not to debug a restart they never
+    issued (#2). Both stay blocked: this names the condition, it does not exempt anything.
+    """
+    try:
+        if contains_launchctl_submit_command(command):
+            return LifecycleRefusal(
+                LAUNCHCTL_SUBMIT_CONDITION,
+                "an executed `launchctl submit`/`bootstrap` registers a new persistent launchd job "
+                "(its label is chosen by the caller, so no label anchor can exempt it)",
+            )
+        from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+        normalized = _SHELL_LINE_CONTINUATION.sub(" ", strip_inert_heredoc_bodies(command))
+        profile_match = _PROFILE_FLAG_LIFECYCLE_PATTERN.search(normalized)
+        if profile_match:
+            named = (profile_match.group(1) or profile_match.group(2) or "").strip().strip("\"'")
+            if named and _named_profile_is_current(named):
+                return LifecycleRefusal(
+                    LIFECYCLE_COMMAND_CONDITION,
+                    f"the self-targeting profile form matched at a command position: "
+                    f"{profile_match.group(0)!r} names the profile this guard runs under",
+                )
+        match = _GATEWAY_LIFECYCLE_PATTERN.search(normalized)
+        if match:
+            if _inside_quoted_span(normalized, match.start()):
+                return LifecycleRefusal(
+                    LIFECYCLE_TEXT_CONDITION,
+                    f"the gateway-lifecycle pattern matched {match.group(0)!r} inside a quoted "
+                    f"string, so the trigger is the text, not an executed command — describe the "
+                    f"operation by role and location instead of quoting the literal command",
+                )
+            return LifecycleRefusal(
+                LIFECYCLE_COMMAND_CONDITION,
+                f"the gateway-lifecycle pattern matched {match.group(0)!r} at a command position",
+            )
+        if _contains_launchctl_gateway_lifecycle(normalized):
+            return LifecycleRefusal(
+                LIFECYCLE_TEXT_CONDITION,
+                "a launchctl lifecycle verb and the hermes-gateway label both appear in this input "
+                "but not in one tokenized command span (a shell loop can build the label in an "
+                "earlier segment), so no command-position scan sees them together",
+            )
+        return LifecycleRefusal(
+            LIFECYCLE_TEXT_CONDITION,
+            "the pattern matched only after tokenization re-joined the words (a quote/backslash "
+            "splice such as kick\"start\", or a Python argv list), so no command position carries "
+            "that token",
+        )
+    except Exception:
+        logger.debug("lifecycle guard could not name its direct-scan match", exc_info=True)
+        return LifecycleRefusal(
+            LIFECYCLE_TEXT_CONDITION,
+            f"the gateway-lifecycle scan matched this input ({len(command)} chars) but the matching "
+            f"pass could not be named without re-scanning it",
+        )
 
 
 # --- path handling ----------------------------------------------------------------------------
@@ -843,6 +1045,38 @@ def _read_referenced_script(
     return data.decode("utf-8", errors="replace"), False
 
 
+def _describe_read_refusal(path: Path, *, max_bytes: Optional[int] = None) -> LifecycleRefusal:
+    """Name why a referenced-script read failed closed (``_read_referenced_script`` → unsafe).
+
+    Stat-only and bracket-cheap: it never opens the file, and the cloud check comes first precisely
+    because opening a FileProvider placeholder can hang the scan.
+    """
+    limit = _capped_read_limit(max_bytes)
+    if _on_cloud_path(path):
+        return LifecycleRefusal(
+            CLOUD_PATH_CONDITION,
+            f"{path} is on a cloud-synced FileProvider path (iCloud Drive / ~/Library/CloudStorage) "
+            f"and is refused without being opened, because an evicted placeholder can hang the scan",
+        )
+    try:
+        metadata = path.stat()
+    except (OSError, ValueError):
+        return LifecycleRefusal(
+            UNREADABLE_SCRIPT_CONDITION,
+            f"{path} could not be read, so its contents could not be certified",
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        return LifecycleRefusal(
+            NON_REGULAR_PATH_CONDITION,
+            f"{path} is not a regular file, so it is refused unevaluated",
+        )
+    return LifecycleRefusal(
+        OVERSIZED_SCRIPT_CONDITION,
+        f"{path} is {metadata.st_size} bytes, above the {limit}-byte referenced-script scan cap, so "
+        f"its contents could not be read and certified",
+    )
+
+
 def _sanitize_remote_script_text(
     text: Optional[str], *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
@@ -866,17 +1100,21 @@ def _sanitize_remote_script_text(
     return text, False
 
 
-def _read_script_for_scanning(script_path: str) -> str:
-    """Read a cron script with the bounded scanner. Non-regular/oversized inputs fail closed via a
-    lifecycle-shaped sentinel; missing/unreadable paths stay empty so scheduler validation reports
-    them."""
+def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[LifecycleRefusal]]:
+    """Read a cron script with the bounded scanner.
+
+    Non-regular/oversized inputs fail closed as a NAMED refusal rather than a lifecycle-shaped
+    sentinel: the sentinel made the refusal read as "contains a gateway lifecycle command" when the
+    real cause was a file the scanner could not read (#2). Missing/unreadable paths stay empty so
+    scheduler path validation reports them.
+    """
     resolved = _resolve_script_path(script_path)
     if resolved is None:
-        return ""
+        return "", None
     script_text, unsafe = _read_referenced_script(resolved)
     if unsafe:
-        return "hermes gateway restart"
-    return script_text or ""
+        return "", _describe_read_refusal(resolved)
+    return script_text or "", None
 
 
 # --- recursive walk ---------------------------------------------------------------------------
@@ -884,29 +1122,35 @@ def _read_script_for_scanning(script_path: str) -> str:
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
+) -> Optional[LifecycleRefusal]:
+    """Return the refusal (which condition failed, and its evidence) or None when nothing matched."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
         return _budget_exhausted("text", depth)
     if _direct_lifecycle_scan(command):
-        return True
+        return _describe_direct_refusal(command)
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return LifecycleRefusal(
+            DEPTH_CONDITION,
+            f"the nested-command chain is deeper than the {_MAX_REFERENCED_SCRIPT_DEPTH}-level "
+            f"referenced-script scan limit, so the remainder could not be read and certified",
+        )
 
-    def recurse(text: str, cwd: Optional[str]) -> bool:
+    def recurse(text: str, cwd: Optional[str]) -> Optional[LifecycleRefusal]:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script,
         )
 
     for payload in _iter_shell_command_payloads(command):
-        if recurse(payload, cwd):
-            return True
+        refusal = recurse(payload, cwd)
+        if refusal is not None:
+            return refusal
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
-            return True
+            return _describe_read_refusal(script_path, max_bytes=budget.bytes_remaining)
         resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
@@ -917,7 +1161,7 @@ def _contains_unsafe_gateway_action(
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            return True
+            return _describe_read_refusal(script_path, max_bytes=budget.bytes_remaining)
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
             # local read — sanitize identically (binary skip + size fail-closed).
@@ -927,13 +1171,57 @@ def _contains_unsafe_gateway_action(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                return True
+                return LifecycleRefusal(
+                    OVERSIZED_SCRIPT_CONDITION,
+                    f"the remote copy of {script_path} exceeds the "
+                    f"{_capped_read_limit(budget.bytes_remaining)}-byte referenced-script scan cap "
+                    f"(or decoded to binary), so it could not be certified",
+                )
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd):
-            return True
-    return False
+        refusal = recurse(script_text, _resolve_script_directory(str(resolved)) or cwd)
+        if refusal is not None:
+            return refusal
+    return None
+
+
+def explain_gateway_lifecycle_refusal(
+    command: str, *, cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> Optional[LifecycleRefusal]:
+    """Return *why* the guard refuses *command*, or ``None`` when it does not.
+
+    Identical verdict to ``contains_gateway_lifecycle_command_or_referenced_script`` — this is that
+    function with the reason kept instead of dropped. Callers that surface a message to a human (the
+    terminal tool, the cron creation path) use this so the refusal names the condition that failed;
+    callers that only branch on the verdict keep using the bool wrapper. Total by construction:
+    never raises.
+    """
+    try:
+        return _contains_unsafe_gateway_action(
+            command, cwd=cwd, depth=0, visited=set(), budget=_LifecycleScanBudget(),
+            read_remote_script=read_remote_script,
+        )
+    except Exception:
+        logger.warning(
+            "lifecycle guard referenced-script walk failed; "
+            "falling back to direct-scan verdict",
+            exc_info=True,
+        )
+        try:
+            if _direct_lifecycle_scan(command):
+                return _describe_direct_refusal(command)
+            return None
+        except Exception:
+            # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
+            if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command):
+                return LifecycleRefusal(
+                    LIFECYCLE_TEXT_CONDITION,
+                    "the direct lifecycle scan matched this input (the walk that would have named "
+                    "the matching pass failed — see the lifecycle guard's log)",
+                )
+            return None
 
 
 def contains_gateway_lifecycle_command_or_referenced_script(
@@ -949,24 +1237,39 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     This is the contract #76762 established ("a guarded path must never crash the guard") enforced at the
     boundary instead of per-syscall: a guard crash propagates out of ``tools/terminal_tool.py`` and breaks
     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
-    verdict.
+    verdict. Verdict-only wrapper: ``explain_gateway_lifecycle_refusal`` keeps the reason.
     """
-    try:
-        return _contains_unsafe_gateway_action(
-            command, cwd=cwd, depth=0, visited=set(), budget=_LifecycleScanBudget(),
-            read_remote_script=read_remote_script,
+    return (
+        explain_gateway_lifecycle_refusal(command, cwd=cwd, read_remote_script=read_remote_script)
+        is not None
+    )
+
+
+def _refusal_message(refusal: LifecycleRefusal) -> str:
+    """The operator-facing sentence for a refusal: the failed condition, then what to do (#2).
+
+    A refusal that cannot be scanned (unreadable, non-regular, oversized) must not claim a lifecycle
+    command was found — that sent an operator to debug a restart they never issued.
+    """
+    if refusal.condition in (
+        OVERSIZED_SCRIPT_CONDITION,
+        NON_REGULAR_PATH_CONDITION,
+        UNREADABLE_SCRIPT_CONDITION,
+    ):
+        return (
+            "Blocked: the cron script could not be scanned, so it cannot be certified free of a "
+            f"gateway lifecycle command. Failing condition "
+            f"({refusal.condition}): {refusal.detail}. Move it to a path the guard can read and "
+            "keep it under the scanned-size cap, then recreate the job (#30719)."
         )
-    except Exception:
-        logger.warning(
-            "lifecycle guard referenced-script walk failed; "
-            "falling back to direct-scan verdict",
-            exc_info=True,
-        )
-        try:
-            return _direct_lifecycle_scan(command)
-        except Exception:
-            # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
-            return contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command)
+    return (
+        "Blocked: cron job contains a gateway lifecycle command or persistent "
+        f"launchctl submit operation. Failing condition ({refusal.condition}): {refusal.detail}. "
+        "This is blocked to prevent agent-driven "
+        "SIGTERM-respawn loops under launchd/systemd supervision "
+        "(#30719). Run `hermes gateway restart` from a shell outside "
+        "the running gateway instead."
+    )
 
 
 def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None) -> None:
@@ -976,6 +1279,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
     propagate."""
     combined = prompt or ""
     python_script = False
+    script_refusal: Optional[LifecycleRefusal] = None
     if script:
         resolved_script = _resolve_script_path(script)
         # Attribute the refusal correctly: not a lifecycle command, but a cloud path never opened.
@@ -994,30 +1298,30 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
                 "(e.g. ~/.hermes/scripts/) and recreate the job."
             )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
-        script_text = _read_script_for_scanning(script)
+        script_text, script_refusal = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
 
+    refusal: Optional[LifecycleRefusal] = None
     if python_script:
         # Python runs via the interpreter, never a POSIX shell, and the shell reference walk is a
         # false-positive generator on Python sources (pathlib "/" resolves to the filesystem root).
-        # The regex still scans the full text; non-regular/oversized files fail closed (sentinel).
-        # The data-exemption masker tokenizes with shlex, so it is charged against the walk budget.
-        # The direct command regex below still scans the full text, so a literal `hermes gateway restart`
-        # embedded in a .py script is still blocked. See #77131, #78398.
+        # The regex still scans the full text; non-regular/oversized files fail closed (named
+        # refusal above). The data-exemption masker tokenizes with shlex, so it is charged against
+        # the walk budget. The direct command regex below still scans the full text, so a literal
+        # `hermes gateway restart` embedded in a .py script is still blocked. See #77131, #78398.
         if not _LifecycleScanBudget().charge_text(combined):
-            unsafe = _budget_exhausted("text", 0)
-        else:
-            unsafe = _lifecycle_command_scan_with_data_exemption(combined)
+            refusal = _budget_exhausted("text", 0)
+        elif _lifecycle_command_scan_with_data_exemption(combined):
+            refusal = _describe_direct_refusal(combined)
     else:
-        unsafe = contains_gateway_lifecycle_command_or_referenced_script(
+        refusal = explain_gateway_lifecycle_refusal(
             combined, cwd=_resolve_script_directory(script) if script else None
         )
-    if unsafe:
-        raise GatewayLifecycleBlocked(
-            "Blocked: cron job contains a gateway lifecycle command or persistent "
-            "launchctl submit operation. This is blocked to prevent agent-driven "
-            "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
-        )
+
+    # An unscannable script is only the reason when nothing else explained the refusal: a lifecycle
+    # command found in the prompt itself is the more useful thing to report.
+    if refusal is None and script_refusal is not None:
+        refusal = script_refusal
+    if refusal is not None:
+        raise GatewayLifecycleBlocked(_refusal_message(refusal))

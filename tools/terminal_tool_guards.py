@@ -204,8 +204,8 @@ def gateway_lifecycle_block(
         return None
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
-        contains_gateway_lifecycle_command_or_referenced_script,
         contains_launchctl_submit_command,
+        explain_gateway_lifecycle_refusal,
         lifecycle_scan_root_within_budget,
     )
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
@@ -227,14 +227,20 @@ def gateway_lifecycle_block(
     guard_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
     )
-    if contains_gateway_lifecycle_command_or_referenced_script(
+    refusal = explain_gateway_lifecycle_refusal(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
-    ):
+    )
+    if refusal is not None:
+        # Name the condition that failed: a quoted match ("text, not an action"), an oversized
+        # data file, or an exhausted scan budget are different problems for the operator, and
+        # "a lifecycle command was found" sent them debugging an action they never issued (#2).
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
-            "uninstall the gateway from inside the gateway process. The gateway would "
+            "uninstall the gateway from inside the gateway process. "
+            f"Failing condition ({refusal.condition}): {refusal.detail}. "
+            "The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
             "separate shell outside the running gateway.",
