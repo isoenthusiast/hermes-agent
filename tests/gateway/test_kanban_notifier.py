@@ -905,3 +905,51 @@ def test_failed_review_wake_reclaims_interactive_claim(tmp_path, monkeypatch):
         assert reclaimed.outcome == "reclaimed"
     finally:
         conn.close()
+
+
+def test_failed_review_wake_delivery_error_reclaims_interactive_claim(tmp_path, monkeypatch):
+    """An exception from the wake delivery path also releases its claim."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake-error.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+
+    async def fail_wake(*args, **kwargs):
+        raise RuntimeError("transport failed")
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", fail_wake)
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "review"
+        assert task.current_run_id is None and task.claim_lock is None
+        reclaimed = kb.latest_run(conn, tid)
+        assert reclaimed is not None and reclaimed.outcome == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_stale_review_wake_cleanup_cannot_reclaim_replacement_run(tmp_path, monkeypatch):
+    """Cleanup for run N must not release a replacement reviewer run N+1."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake-race.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+    conn = kbc.connect()
+    try:
+        first = kb.claim_review_task(conn, tid, claimer="interactive-1")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = first.current_run_id
+        assert kb.reclaim_review_task(conn, tid, first_run_id, reason="first wake failed")
+        replacement = kb.claim_review_task(conn, tid, claimer="interactive-2")
+        assert replacement is not None and replacement.current_run_id is not None
+        assert replacement.current_run_id != first_run_id
+        assert not kb.reclaim_review_task(conn, tid, first_run_id, reason="stale cleanup")
+        held = kb.get_task(conn, tid)
+        assert held is not None
+        assert held.status == "running"
+        assert held.current_run_id == replacement.current_run_id
+        assert held.claim_lock == "interactive-2"
+    finally:
+        conn.close()

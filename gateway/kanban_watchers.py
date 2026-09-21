@@ -164,18 +164,25 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
-    def _kanban_reclaim_review(self, task_id: str, board: Optional[str] = None) -> bool:
-        """Release a review claim when its interactive wake was not accepted.
+    def _kanban_reclaim_review(
+        self, task_id: str, review_run_id: int, board: Optional[str] = None,
+    ) -> bool:
+        """Release this review claim when its interactive wake was not accepted.
 
         The notifier claims before waking to race-proof review dispatch. If
-        admission fails, ``reclaim_task`` restores the ``review`` lane instead
-        of leaving the card ``running`` until the claim TTL expires.
+        admission fails, the run-id-guarded helper restores the ``review`` lane
+        instead of leaving the card ``running`` until the claim TTL expires.
+        A replacement run may have claimed the card while cleanup was queued;
+        that run must never be reclaimed by this stale cleanup.
         """
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db as _kb
         conn = _kbc.connect(board=board)
         try:
-            return _kb.reclaim_task(conn, task_id, reason="interactive review wake failed")
+            return _kb.reclaim_review_task(
+                conn, task_id, review_run_id,
+                reason="interactive review wake failed",
+            )
         finally:
             conn.close()
 

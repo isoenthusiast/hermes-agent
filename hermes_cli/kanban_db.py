@@ -2544,6 +2544,60 @@ def reclaim_task(
     return True
 
 
+def reclaim_review_task(
+    conn: sqlite3.Connection, task_id: str, review_run_id: int, *, reason: Optional[str] = None,
+) -> bool:
+    """Release one interactive review claim, only if its run still owns it.
+
+    This is deliberately narrower than :func:`reclaim_task`: wake cleanup is
+    asynchronous, so an old failure must not reclaim a replacement reviewer.
+    The claimed event is also checked to ensure the run came from the review
+    lane rather than an implementation run.
+    """
+    expected_run_id = int(review_run_id)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            not row
+            or row["status"] != "running"
+            or row["current_run_id"] != expected_run_id
+        ):
+            return False
+        claimed = _latest_event(conn, task_id, "claimed", expected_run_id)
+        claimed_payload = _json_dict(_row_get(claimed, "payload"))
+        if claimed_payload.get("source_status") != "review":
+            return False
+        prev_lock = row["claim_lock"]
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=None,
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock IS ?",
+            (task_id, expected_run_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        _record_reclaim(
+            conn, task_id, termination,
+            error=f"review_wake_reclaim: {reason}" if reason else "review_wake_reclaim",
+            payload={
+                "manual": False,
+                "reason": reason,
+                "prev_lock": prev_lock,
+                "review_run_id": expected_run_id,
+                "retry_status": "review",
+            },
+        )
+    _clear_failure_counter(conn, task_id)
+    return True
+
+
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
     reason: Optional[str] = None,

@@ -663,7 +663,8 @@ class _KanbanNotification:
                 # subscription alive regardless of how long admission takes.
                 if self.review_run_id is not None:
                     await _to_thread_process_service(
-                        self.runner._kanban_reclaim_review, self.task_id, self.board_slug,
+                        self.runner._kanban_reclaim_review, self.task_id,
+                        self.review_run_id, self.board_slug,
                     )
                     self.review_run_id = None
                 await self.rewind()
@@ -671,7 +672,8 @@ class _KanbanNotification:
             except Exception as _wk_err:
                 if self.review_run_id is not None:
                     await _to_thread_process_service(
-                        self.runner._kanban_reclaim_review, self.task_id, self.board_slug,
+                        self.runner._kanban_reclaim_review, self.task_id,
+                        self.review_run_id, self.board_slug,
                     )
                     self.review_run_id = None
                 await self._wake_failed(
