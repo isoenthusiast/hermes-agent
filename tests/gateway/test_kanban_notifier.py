@@ -876,3 +876,32 @@ def test_duplicate_review_dispatch_is_suppressed_and_logged(
         assert _unseen_review_requested_for(tid, "chat-1") == []
     finally:
         conn.close()
+
+
+def test_failed_review_wake_reclaims_interactive_claim(tmp_path, monkeypatch):
+    """A rejected interactive wake must not wedge the review card as running."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake-failure.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+
+    async def reject_wake(*args, **kwargs):
+        from gateway.wake import WakeNotAccepted
+        raise WakeNotAccepted("session queue full")
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", reject_wake)
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        reclaimed = kb.latest_run(conn, tid)
+        assert reclaimed is not None
+        assert reclaimed.outcome == "reclaimed"
+    finally:
+        conn.close()

@@ -164,6 +164,21 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    def _kanban_reclaim_review(self, task_id: str, board: Optional[str] = None) -> bool:
+        """Release a review claim when its interactive wake was not accepted.
+
+        The notifier claims before waking to race-proof review dispatch. If
+        admission fails, ``reclaim_task`` restores the ``review`` lane instead
+        of leaving the card ``running`` until the claim TTL expires.
+        """
+        from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli import kanban_db as _kb
+        conn = _kbc.connect(board=board)
+        try:
+            return _kb.reclaim_task(conn, task_id, reason="interactive review wake failed")
+        finally:
+            conn.close()
+
     async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
         """Upload artifact files referenced by a completed kanban task.
 

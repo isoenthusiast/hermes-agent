@@ -661,9 +661,19 @@ class _KanbanNotification:
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.
+                if self.review_run_id is not None:
+                    await _to_thread_process_service(
+                        self.runner._kanban_reclaim_review, self.task_id, self.board_slug,
+                    )
+                    self.review_run_id = None
                 await self.rewind()
                 return
             except Exception as _wk_err:
+                if self.review_run_id is not None:
+                    await _to_thread_process_service(
+                        self.runner._kanban_reclaim_review, self.task_id, self.board_slug,
+                    )
+                    self.review_run_id = None
                 await self._wake_failed(
                     "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
                     else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
