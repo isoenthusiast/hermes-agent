@@ -1,5 +1,5 @@
-"""Turn-end guard for kanban workers, which must end with ``kanban_complete`` or
-``kanban_block``. Some models narrate the next step and stop with no tool calls;
+"""Turn-end guard for kanban workers, which must end with a terminal kanban
+transition. Some models narrate the next step and stop with no tool calls;
 Hermes treats that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
 Policy-only: return a bounded synthetic nudge so the loop continues instead of exiting.
 """
@@ -10,7 +10,14 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    }
+)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -64,8 +71,8 @@ def build_kanban_stop_nudge(
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no "
+        f"The worker turn for task `{tid}` ended without a terminal board tool. "
+        "Ending now without one causes a protocol violation (clean exit with no "
         "`kanban_complete` / `kanban_block`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
